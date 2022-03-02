@@ -224,7 +224,6 @@ class AssetPermissionAssignmentViewSet(AssetNestedObjectViewsetMixin,
             else:
                 # An old assigment that should be kept; remove from list of
                 # potential new assignments to search and add
-                del searchable_new_assigns[new_assign_idx]
                 # …unless it's a partial permission; unconditionally re-assign
                 # those to avoid diffing them
                 if (
@@ -233,6 +232,8 @@ class AssetPermissionAssignmentViewSet(AssetNestedObjectViewsetMixin,
                     .codename
                     != PERM_PARTIAL_SUBMISSIONS
                 ):
+                    # KEEP THOSE INDEXES IN SYNC!
+                    del searchable_new_assigns[new_assign_idx]
                     del new_assignment_serializers[new_assign_idx]
 
         t3 = time.time()
