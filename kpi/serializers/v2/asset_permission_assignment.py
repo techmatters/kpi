@@ -1,13 +1,13 @@
 # coding: utf-8
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 
 from django.contrib.auth.models import Permission, User
 from django.urls import Resolver404
 from django.utils.translation import gettext as t
 from rest_framework import serializers
-from rest_framework.fields import empty, SkipField
+from rest_framework.fields import empty
 from rest_framework.reverse import reverse
-from rest_framework.relations import Hyperlink, PKOnlyObject
+
 
 from kpi.constants import (
     PERM_PARTIAL_SUBMISSIONS,
@@ -19,6 +19,9 @@ from kpi.fields.relative_prefix_hyperlinked_related import (
 )
 from kpi.models.asset import Asset
 from kpi.models.object_permission import ObjectPermission
+from kpi.utils.object_permission import (
+    get_user_permission_assignments_queryset,
+)
 from kpi.utils.urls import absolute_resolve
 
 
@@ -323,6 +326,97 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
         super().__init__(instance=instance, data=data, **kwargs)
         self._assignments = []
 
+    def create(self, validated_data):
+
+        request = self.context['request']
+        asset = self.context['asset']
+
+        new_assignments = validated_data['assignments']
+        new_assignments_by_user = defaultdict(list)
+        searchable_new_assigns = []
+
+        for new_assignment in new_assignments:
+            new_assignments_by_user[new_assignment['user'].pk].append(new_assignment)
+            searchable_new_assigns.append((
+                new_assignment['user'].pk,
+                new_assignment['permission'].pk,
+            ))
+
+        old_assignments = list(
+            get_user_permission_assignments_queryset(
+                asset, request.user
+            ).exclude(user=asset.owner)
+        )
+
+        old_assign_idxs_to_del = []
+
+        for old_assign_idx, old_assign in enumerate(old_assignments):
+            try:
+                new_assign_idx = searchable_new_assigns.index(
+                    (old_assign.user_id, old_assign.permission_id)
+                )
+            except ValueError:
+                # An old assignment that has been removed
+                old_assign_idxs_to_del.append(old_assign_idx)
+            else:
+                # An old assignment that should be kept; remove from list of
+                # potential new assignments to search and add
+                # …unless it's a partial permission; unconditionally re-assign
+                # those to avoid diffing them
+
+                if (
+                    new_assignments[new_assign_idx]['permission'].codename
+                    != PERM_PARTIAL_SUBMISSIONS
+                ):
+                    del new_assignments[new_assign_idx]
+                    del searchable_new_assigns[new_assign_idx]
+
+        # let's do the removals first
+        # …in case they remove something implied by a new assignment (?)
+        users_to_redo = set()
+        for del_idx in old_assign_idxs_to_del:
+            perm = old_assignments[del_idx]
+            print('---', perm, flush=True)
+            users_to_redo.add(perm.user.pk)
+            asset.remove_perm(perm.user, perm.permission.codename)
+
+        # ToDo Bulk delete
+
+        for ser in new_assignments:
+            if ser['user'].pk in users_to_redo:
+                # gonna have to deal with you later anyway
+                continue
+
+            print('SER', ser, flush=True)
+            perm = asset.assign_perm(
+                user_obj=ser['user'],
+                perm=ser['permission'].codename,
+                partial_perms=ser.get('partial_permissions'),
+            )
+            print('+++', perm)
+
+        # whoops, you had manage and got reduced to change
+        # the BE had manage, change, view
+        # the FE sent change
+        # we removed manage and view but added nothin'
+        #
+        # ideas…
+        # do all deletions, then re-query db?
+        # do a per-user diff?
+
+        # how about: re-add all extant perms for users who had deletions
+        for user_id in users_to_redo:
+            extant_assigns = new_assignments_by_user[user_id]
+            for serializer in extant_assigns:
+                perm = asset.assign_perm(
+                    user_obj=serializer['user'],
+                    perm=serializer['permission'].codename,
+                    partial_perms=serializer.get('partial_permissions'),
+                )
+                print('++++++', perm, flush=True)
+
+        return new_assignments
+
     def validate(self, attrs):
         usernames = []
         codenames = []
@@ -417,10 +511,3 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
         for obj in object_list:
             if value == getattr(obj, fieldname):
                 return obj
-
-    #class Meta:
-    #    model = ObjectPermission
-    #    fields = (
-    #        'user',
-    #        'permission',
-    #    )
