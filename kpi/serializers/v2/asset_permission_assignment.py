@@ -1,15 +1,22 @@
 # coding: utf-8
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 from django.contrib.auth.models import Permission, User
-from django.urls import resolve, Resolver404
+from django.urls import Resolver404
 from django.utils.translation import gettext as t
 from rest_framework import serializers
+from rest_framework.fields import empty, SkipField
 from rest_framework.reverse import reverse
+from rest_framework.relations import Hyperlink, PKOnlyObject
 
-from kpi.constants import PREFIX_PARTIAL_PERMS, SUFFIX_SUBMISSIONS_PERMS
-from kpi.fields.relative_prefix_hyperlinked_related import \
-    RelativePrefixHyperlinkedRelatedField
+from kpi.constants import (
+    PERM_PARTIAL_SUBMISSIONS,
+    PREFIX_PARTIAL_PERMS,
+    SUFFIX_SUBMISSIONS_PERMS,
+)
+from kpi.fields.relative_prefix_hyperlinked_related import (
+    RelativePrefixHyperlinkedRelatedField,
+)
 from kpi.models.asset import Asset
 from kpi.models.object_permission import ObjectPermission
 from kpi.utils.urls import absolute_resolve
@@ -230,7 +237,7 @@ class AssetPermissionAssignmentSerializer(serializers.ModelSerializer):
     def _validate_permission(self, codename, suffix=None):
         """
         Validates if `codename` can be assigned on `Asset`s.
-        Search can be restricted to assignable codenames which end with `prefix`
+        Search can be restricted to assignable codenames which end with `suffix`
 
         :param codename: str. See `Asset.ASSIGNABLE_PERMISSIONS
         :param suffix: str.
@@ -277,3 +284,143 @@ class AssetBulkInsertPermissionSerializer(AssetPermissionAssignmentSerializer):
             'user',
             'permission',
         )
+
+
+class PartialPermissionField(serializers.Field):
+    default_error_messages = {
+        'invalid': t('Not a valid list.'),
+        'blank': t('This field may not be blank.'),
+    }
+    initial = ''
+
+    def __init__(self, **kwargs):
+        super().__init__(required=False, **kwargs)
+
+    def to_internal_value(self, data):
+        # We're lenient with allowing basic numerics to be coerced into strings,
+        # but other types should fail. Eg. unclear if booleans should represent as `true` or `True`,
+        # and composites such as lists are likely user error.
+        if not isinstance(data, list):
+            self.fail('invalid')
+        return data
+
+    def to_representation(self, value):
+        return value
+
+
+class PermissionAssignmentSerializer(serializers.Serializer):
+
+    user = serializers.CharField()
+    permission = serializers.CharField()
+    partial_permissions = PartialPermissionField()
+
+
+class BulkPermissionAssignmentSerializer(serializers.Serializer):
+
+    assignments = serializers.ListField(child=PermissionAssignmentSerializer())
+
+    def __init__(self, instance=None, data=empty, **kwargs):
+        super().__init__(instance=instance, data=data, **kwargs)
+        self._assignments = []
+
+    def validate(self, attrs):
+        usernames = []
+        codenames = []
+        partial_codenames = []
+        for assignment in attrs['assignments']:
+            codename = self._get_permission_codename(assignment['permission'])
+            codenames.append(codename)
+            if codename == PERM_PARTIAL_SUBMISSIONS:
+                for partial_assignment in assignment['partial_permissions']:
+                    partial_codenames.append(
+                        self._get_permission_codename(partial_assignment['url'])
+                    )
+
+            usernames.append(self._get_username(assignment['user']))
+
+        self._validate_codenames(partial_codenames, suffix=SUFFIX_SUBMISSIONS_PERMS)
+        users = self._validate_usernames(usernames)
+        permissions = self._validate_codenames(codenames)
+
+        assert len(codenames) == len(usernames) == len(attrs['assignments'])
+
+        assignment_objects = []
+        for idx, assignment in enumerate(attrs['assignments']):
+            assignment_object = {
+                'user': self._get_object(usernames[idx], users, 'username'),
+                'permission': self._get_object(codenames[idx], permissions, 'codename')
+            }
+            if codenames[idx] == PERM_PARTIAL_SUBMISSIONS:
+                assignment_object['partial_permissions'] = defaultdict(list)
+                for partial_perms in assignment['partial_permissions']:
+                    partial_codename = partial_codenames.pop(0)
+                    assignment_object['partial_permissions'][
+                        partial_codename
+                    ] = partial_perms['filters']
+
+            assignment_objects.append(assignment_object)
+
+        attrs['assignments'] = assignment_objects
+
+        return attrs
+
+    def _get_permission_codename(self, permission_url: str) -> str:
+        try:
+            resolver_match = absolute_resolve(permission_url)
+            codename = resolver_match.kwargs['codename']
+        except (TypeError, KeyError, Resolver404):
+            raise serializers.ValidationError(
+                t('Invalid permission: `## permission_url ##`').format(
+                    {'## permission_url ##': permission_url}
+                )
+            )
+
+        return codename
+
+    def _get_username(self, user_url: str) -> str:
+        try:
+            resolver_match = absolute_resolve(user_url)
+            username = resolver_match.kwargs['username']
+        except (TypeError, KeyError, Resolver404):
+            raise serializers.ValidationError(
+                t('Invalid user: `## user_url ##`').format(
+                    {'## user_url ##': user_url}
+                )
+            )
+
+        return username
+
+    def _validate_codenames(self, codenames: list, suffix: str = None) -> list:
+        asset = self.context['asset']
+        codenames = set(codenames)
+        assignable_permissions = asset.get_assignable_permissions(
+            with_partial=True
+        )
+        diff = codenames.difference(assignable_permissions)
+        if diff:
+            raise serializers.ValidationError('ERREUR CODENAMES')
+
+        if suffix:
+            return
+
+        return Permission.objects.filter(codename__in=codenames)
+
+    def _validate_usernames(self, usernames: list) -> list:
+        usernames = set(usernames)
+        users = list(User.objects.filter(username__in=usernames))
+        if len(users) != len(usernames):
+            raise serializers.ValidationError('ERREUR USERS')
+
+        return users
+
+    def _get_object(self, value, object_list, fieldname):
+        for obj in object_list:
+            if value == getattr(obj, fieldname):
+                return obj
+
+    #class Meta:
+    #    model = ObjectPermission
+    #    fields = (
+    #        'user',
+    #        'permission',
+    #    )

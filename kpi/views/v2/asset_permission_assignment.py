@@ -20,11 +20,11 @@ from kpi.permissions import AssetPermissionAssignmentPermission
 from kpi.serializers.v2.asset_permission_assignment import (
     AssetBulkInsertPermissionSerializer,
     AssetPermissionAssignmentSerializer,
+    BulkPermissionAssignmentSerializer,
 )
 from kpi.utils.object_permission import (
     get_user_permission_assignments_queryset,
 )
-
 from kpi.utils.viewset_mixins import AssetNestedObjectViewsetMixin
 
 
@@ -174,45 +174,88 @@ class AssetPermissionAssignmentViewSet(AssetNestedObjectViewsetMixin,
 
         assignments = request.data
         ### SLOP
-        asset = self.asset
         import time
+        from collections import defaultdict
+        from kpi.utils.object_permission import (
+            get_user_permission_assignments_queryset,
+        )
+        from kpi.constants import PERM_PARTIAL_SUBMISSIONS
+
+        asset = self.asset
+
         t0 = time.time()
         context_ = dict(self.get_serializer_context())
         context_['bulk'] = True
         new_assignment_serializers = []
         searchable_new_assigns = []
-        from collections import defaultdict
-        new_a_s_by_user = defaultdict(list)
-        from kpi.constants import PERM_PARTIAL_SUBMISSIONS
-        for assignment in assignments:
-            context_.pop('partial_permissions', None)
-            if 'partial_permissions' in assignment:
-                context_['partial_permissions'] = assignment['partial_permissions']
 
-            serializer = AssetBulkInsertPermissionSerializer(
-                data=assignment,
-                context=context_
-            )
-            serializer.is_valid()
-            validated_data = serializer.validated_data
-            new_assignment_serializers.append(serializer)
-            new_a_s_by_user[serializer.validated_data['user'].pk].append(serializer)
+        new_a_s_by_user = defaultdict(list)
+        # print('ASSIGNMENTS', assignments, flush=True)
+        serializer = BulkPermissionAssignmentSerializer(
+            data={'assignments': assignments},
+            context=context_
+        )
+        print('IS VALID', serializer.is_valid(raise_exception=True), flush=True)
+        new_assignment_serializers = serializer.validated_data['assignments']
+
+        import pprint
+        pp = pprint.PrettyPrinter(indent=2, width=80)
+        pp.pprint(new_assignment_serializers)
+        
+        searchable_new_assigns = []
+        for n_s_a in new_assignment_serializers:
             searchable_new_assigns.append((
-                serializer.validated_data['user'].pk,
-                serializer.validated_data['permission'].pk
-                # WHOA PARTIAL PERMISSIONS EH?
+                n_s_a['user'].pk,
+                n_s_a['permission'].pk,
             ))
 
-        t1 = time.time()
+        # return Response(serializer.data)
 
-        from kpi.utils.object_permission import (
-            get_user_permission_assignments_queryset,
+        # for assignment in assignments:
+        #     context_.pop('partial_permissions', None)
+        #     if 'partial_permissions' in assignment:
+        #         context_['partial_permissions'] = assignment[
+        #             'partial_permissions']
+        #
+        #     serializer = AssetBulkInsertPermissionSerializer(
+        #         data=assignment,
+        #         context=context_
+        #     )
+        #     serializer.is_valid()
+        #     validated_data = serializer.validated_data
+        #     new_assignment_serializers.append(serializer)
+        #     new_a_s_by_user[serializer.validated_data['user'].pk].append(serializer)
+        #     searchable_new_assigns.append((
+        #         serializer.validated_data['user'].pk,
+        #         serializer.validated_data['permission'].pk
+        #         # WHOA PARTIAL PERMISSIONS EH?
+        #     ))
+        #
+        # print('NEW ASSIGNMENT SERIALIZERS', flush=True)
+        # pp.pprint(searchable_new_assigns)
+        #
+        t1 = time.time()
+        # print(t0_1 - t0, t1 - t0_1, flush=True)
+        # assert tmp_id == searchable_new_assigns
+        # assert len(new_serialized_assignments) == len(new_assignment_serializers)
+        # return Response([])
+
+        old_assignments = list(
+            get_user_permission_assignments_queryset(
+                asset, request.user
+            ).exclude(user=asset.owner)
         )
-        old_assignments = list(get_user_permission_assignments_queryset(asset, request.user).exclude(user=asset.owner))
 
         t2 = time.time()
 
         old_assign_idxs_to_del = []
+
+        #print('old_assignments', old_assignments, flush=True)
+        #print('searchable_new_assigns', searchable_new_assigns, flush=True)
+        #print('new_assignment_serializers',
+        #      [(n_a_s.validated_data['user'].pk, n_a_s.validated_data['permission'].pk)
+        #       for n_a_s in new_assignment_serializers], flush=True)
+
         for old_assign_idx, old_assign in enumerate(old_assignments):
             try:
                 new_assign_idx = searchable_new_assigns.index(
@@ -222,19 +265,30 @@ class AssetPermissionAssignmentViewSet(AssetNestedObjectViewsetMixin,
                 # An old assignment that has been removed
                 old_assign_idxs_to_del.append(old_assign_idx)
             else:
-                # An old assigment that should be kept; remove from list of
+                # An old assignment that should be kept; remove from list of
                 # potential new assignments to search and add
+                #print('#########', flush=True)
+                #print('NEW assign idx', new_assign_idx, flush=True)
                 # …unless it's a partial permission; unconditionally re-assign
                 # those to avoid diffing them
+
+                # print('\t new_assignment_serializers[new_assign_idx]',
+                #       (new_assignment_serializers[new_assign_idx].validated_data[
+                #            'user'].pk,
+                #        new_assignment_serializers[new_assign_idx].validated_data[
+                #            'permission'].pk), flush=True)
                 if (
-                    new_assignment_serializers[new_assign_idx]
-                    .validated_data['permission']
-                    .codename
+                    new_assignment_serializers[new_assign_idx][
+                        'permission'
+                    ].codename
                     != PERM_PARTIAL_SUBMISSIONS
                 ):
-                    # KEEP THOSE INDEXES IN SYNC!
-                    del searchable_new_assigns[new_assign_idx]
+                    #print('--> DELETE searchable_new_assigns',
+                    #      searchable_new_assigns[new_assign_idx], flush=True)
+                    #print('--> DELETE new_assignment_serializers', new_assign_idx,
+                    #      flush=True)
                     del new_assignment_serializers[new_assign_idx]
+                    del searchable_new_assigns[new_assign_idx]
 
         t3 = time.time()
 
@@ -243,17 +297,28 @@ class AssetPermissionAssignmentViewSet(AssetNestedObjectViewsetMixin,
         users_to_redo = set()
         for del_idx in old_assign_idxs_to_del:
             perm = old_assignments[del_idx]
-            print('---', perm)
+            print('---', perm, flush=True)
             users_to_redo.add(perm.user.pk)
             self.asset.remove_perm(perm.user, perm.permission.codename)
 
+        # Bulk delete perms
         t4 = time.time()
 
         for ser in new_assignment_serializers:
-            if ser.validated_data['user'].pk in users_to_redo:
+            #print('SER u', ser.validated_data['user'], flush=True)
+            #print('SER p', ser.validated_data['permission'], flush=True)
+            if ser['user'].pk in users_to_redo:
                 # gonna have to deal with you later anyway
+                # print('Continue', flush=True)
                 continue
-            perm = serializer.save(asset=self.asset)
+
+            print('SER', ser, flush=True)
+            perm = self.asset.assign_perm(
+                user_obj=ser['user'],
+                perm=ser['permission'].codename,
+                partial_perms=ser.get('partial_permissions'),
+            )
+            # perm = serializer.save(asset=self.asset)
             print('+++', perm)
 
         # whoops, you had manage and got reduced to change
@@ -264,23 +329,37 @@ class AssetPermissionAssignmentViewSet(AssetNestedObjectViewsetMixin,
         # ideas…
         # do all deletions, then re-query db?
         # do a per-user diff?
+        t5 = time.time()
+
+        print('USERS_to_redo', users_to_redo, flush=True)
+        print('new_a_s_by_user', new_a_s_by_user.keys(), flush=True)
 
         # how about: re-add all extant perms for users who had deletions
         for user in users_to_redo:
             extant_assigns = new_a_s_by_user[user]
             for serializer in extant_assigns:
-                perm = serializer.save(asset=self.asset)
-                print('++++++', perm)
+                #perm = serializer.save(asset=self.asset)
+                perm = self.asset.assign_perm(
+                    user_obj=serializer['user'],
+                    perm=serializer['permission'].codename,
+                    partial_perms=serializer.get('partial_permissions'),
+                )
+                print('++++++', perm, flush=True)
 
-        t5 = time.time()
-        print(t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4)
+        t6 = time.time()
+        print(t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t6 - t5, flush=True)
         return self.list(request, *args, **kwargs)
         ### SLOP
 
+    @action(detail=False, methods=['POST'], renderer_classes=[renderers.JSONRenderer],
+            url_path='bulk')
+    def bulk_assignments2(self, request, *args, **kwargs):
         # We don't want to lock tables, only queries to rollback in case
         # one assignment fails.
-        with transaction.atomic():
+        assignments = request.data
+        asset = self.asset
 
+        with transaction.atomic():
             # First, delete *all* `from_kc_only` flags
             # TODO: Remove after kobotoolbox/kobocat#642
             if self.asset.has_deployment:
@@ -360,12 +439,14 @@ class AssetPermissionAssignmentViewSet(AssetNestedObjectViewsetMixin,
     def get_serializer_context(self):
         """
         Extra context provided to the serializer class.
-        Inject asset_uid to avoid extra queries to DB inside the serializer.
+        Inject asset_uid and asset to avoid extra queries to DB inside
+        the serializer.
         """
 
         context_ = super().get_serializer_context()
         context_.update({
-            'asset_uid': self.asset.uid
+            'asset_uid': self.asset.uid,
+            'asset': self.asset,
         })
         return context_
 
