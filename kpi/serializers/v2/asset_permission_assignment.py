@@ -1,14 +1,14 @@
 # coding: utf-8
 import copy
+import json
 from collections import defaultdict
+from typing import Union
 
 from django.contrib.auth.models import Permission, User
 from django.urls import Resolver404
 from django.utils.translation import gettext as t
 from rest_framework import serializers
-from rest_framework.fields import empty
 from rest_framework.reverse import reverse
-
 
 from kpi.constants import (
     PERM_PARTIAL_SUBMISSIONS,
@@ -18,7 +18,7 @@ from kpi.constants import (
 from kpi.fields.relative_prefix_hyperlinked_related import (
     RelativePrefixHyperlinkedRelatedField,
 )
-from kpi.models.asset import Asset
+from kpi.models.asset import Asset, AssetUserPartialPermission
 from kpi.models.object_permission import ObjectPermission
 from kpi.utils.object_permission import (
     get_user_permission_assignments_queryset,
@@ -65,17 +65,9 @@ class AssetPermissionAssignmentSerializer(serializers.ModelSerializer):
         permission = validated_data['permission']
         partial_permissions = validated_data.get('partial_permissions', None)
 
-        bulk = self.context.get('bulk', False)
-        # When bulk is `True`, the `from_kc_only` flag is removed from *all*
-        # users prior to calling this method. There is no need to remove it
-        # again from each user individually. See
-        # `AssetPermissionAssignmentViewSet.bulk_assignments()`
-        # TODO: Remove after kobotoolbox/kobocat#642
-        if bulk is False and asset.has_deployment:
-            asset.deployment.remove_from_kc_only_flag(specific_user=user)
-
-        return asset.assign_perm(user, permission.codename,
-                                 partial_perms=partial_permissions)
+        return asset.assign_perm(
+            user, permission.codename, partial_perms=partial_permissions
+        )
 
     def get_label(self, object_permission):
         # `self.object_permission.label` calls `self.object_permission.asset`
@@ -280,17 +272,8 @@ class AssetPermissionAssignmentSerializer(serializers.ModelSerializer):
                        request=self.context.get('request', None))
 
 
-class AssetBulkInsertPermissionSerializer(AssetPermissionAssignmentSerializer):
-
-    class Meta:
-        model = ObjectPermission
-        fields = (
-            'user',
-            'permission',
-        )
-
-
 class PartialPermissionField(serializers.Field):
+
     default_error_messages = {
         'invalid': t('Not a valid list.'),
         'blank': t('This field may not be blank.'),
@@ -301,9 +284,6 @@ class PartialPermissionField(serializers.Field):
         super().__init__(required=False, **kwargs)
 
     def to_internal_value(self, data):
-        # We're lenient with allowing basic numerics to be coerced into strings,
-        # but other types should fail. Eg. unclear if booleans should represent as `true` or `True`,
-        # and composites such as lists are likely user error.
         if not isinstance(data, list):
             self.fail('invalid')
         return data
@@ -319,38 +299,56 @@ class PermissionAssignmentSerializer(serializers.Serializer):
     partial_permissions = PartialPermissionField()
 
 
-class BulkPermissionAssignmentSerializer(serializers.Serializer):
+class AssetBulkInsertPermissionSerializer(serializers.Serializer):
+    """
+    This goal of this class is not to expose data in API endpoint,
+    but to process all validation checks and convert URLs into objects at once
+    to avoid multiple queries to DB vs AssetPermissionAssignmentSerializer(many=True)
+    which makes a query to DB to match each RelativePrefixHyperlinkedRelatedField()
+    with an Django model object.
 
+    Warning: If less queries are sent to DB, it consumes more CPU and memory.
+    The bigger the assignments are, the bigger the resources footprint will be.
+    """
     assignments = serializers.ListField(child=PermissionAssignmentSerializer())
 
-    def __init__(self, instance=None, data=empty, **kwargs):
-        super().__init__(instance=instance, data=data, **kwargs)
-        self._assignments = []
-
     def create(self, validated_data):
-
         request = self.context['request']
         asset = self.context['asset']
 
-        new_perm_assignments = validated_data['assignments']
-
         new_perm_assignments_by_user = defaultdict(dict)
-        for new_perm_assignment in new_perm_assignments:
+        # Build a 2D dictionary where first dimension keys are users' PK,
+        # and second dimension key are permission's PK.
+        for new_perm_assignment in validated_data['assignments']:
             new_perm_assignments_by_user[new_perm_assignment['user'].pk][
                 new_perm_assignment['permission'].pk
             ] = new_perm_assignment
 
+        # Retrieve old permission assignment from DB to make diff with POSTed
+        # new permission assignments.
         old_assignments = list(
             get_user_permission_assignments_queryset(
                 asset, request.user
             ).exclude(user=asset.owner)
         )
 
+        # Build another dictionary for old partial permission assignments
+        # Easy to retrieve partial permissions for a specific user.
+        partial_permissions = {}
+        for record in AssetUserPartialPermission.objects.values(
+            'permissions', 'user_id'
+        ).filter(asset=asset):
+            partial_permissions[record['user_id']] = record['permissions']
+
+        # Because we are going to alter the freshly created 2D dictionary (i.e.
+        # remove some elements from it). We need to keep a copy of it re-apply
+        # at the end all missing new permission assignments.
         new_perm_assignments_by_user_copy = copy.deepcopy(
             new_perm_assignments_by_user
         )
-        old_assign_idxs_to_del = []
 
+        # Remove from our 2D dict all permission assignments that did not change
+        old_assign_idxs_to_del = []
         for old_assign_idx, old_assign in enumerate(old_assignments):
             try:
                 perm_assignment = new_perm_assignments_by_user[old_assign.user_id][
@@ -361,18 +359,49 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
                 old_assign_idxs_to_del.append(old_assign_idx)
             else:
                 # An old assignment that should be kept; remove from list of
-                # potential new assignments to search and add
-                # …unless it's a partial permission; unconditionally re-assign
-                # those to avoid diffing them
-
+                # potential new permission assignments.
                 if (
                     perm_assignment[
                         'permission'
                     ].codename != PERM_PARTIAL_SUBMISSIONS
                 ):
-                    del perm_assignment[old_assign.user_id][
+                    # Trivial case: it is a regular permission, just remove it
+                    # from new permission assignments to apply.
+                    del new_perm_assignments_by_user[old_assign.user_id][
                         old_assign.permission_id
                     ]
+                else:
+                    # Partial permission case: We need to compare with
+                    # what is stored in DB (i.e. `partial_permissions`) to see
+                    # whether anything changed.
+                    new_partial_perms = new_perm_assignments_by_user[old_assign.user_id][
+                        old_assign.permission_id
+                    ]['partial_permissions']
+                    old_partial_perms = partial_permissions[old_assign.user_id]
+                    # 'add_submissions' is not used at row level permission.
+                    # It always comes with 'change_submissions'. It appears in
+                    # `partial_permissions` because it is stored in DB when
+                    # calculation for partial permissions is made in
+                    # Asset._update_partial_permissions().
+                    # It is safe to remove it before comparing old and new
+                    # partial perms because if:
+                    # * 'change_submissions' is new, old assignment will not
+                    #   have it, both dictionaries will not match, new assignment
+                    #   will be added later
+                    # * 'change_submissions' is already assigned, old assignment
+                    #   will have it, both dictionaries should match,
+                    #   no new assignment will be applied
+                    old_partial_perms.pop('add_submissions', None)
+
+                    # Not super efficient, but dictionaries are not big, the
+                    # performance cost should negligible.
+                    if (
+                        json.dumps(new_partial_perms, sort_keys=True)
+                        == json.dumps(old_partial_perms, sort_keys=True)
+                    ):
+                        del new_perm_assignments_by_user[old_assign.user_id][
+                            old_assign.permission_id
+                        ]
 
         # let's do the removals first
         # …in case they remove something implied by a new assignment (?)
@@ -381,21 +410,24 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
             perm = old_assignments[del_idx]
             print('---', perm, flush=True)
             users_to_redo.add(perm.user.pk)
+            # This is time consuming. if `old_assign_idxs_to_del` contains a lot
+            # of elements (i.e more than 50), it will take a while.
             asset.remove_perm(perm.user, perm.permission.codename)
 
-        # ToDo Bulk delete
-
-        for user_id, new_perm_assignments_ in new_perm_assignments_by_user.items():
+        for (
+            user_id,
+            new_perm_assignments,
+        ) in new_perm_assignments_by_user.items():
             if user_id in users_to_redo:
                 # gonna have to deal with you later anyway
                 print('REDO', user_id, flush=True)
                 continue
 
-            for new_perm_assignment_ in new_perm_assignments_.values():
+            for new_perm_assignment in new_perm_assignments.values():
                 perm = asset.assign_perm(
-                    user_obj=new_perm_assignment_['user'],
-                    perm=new_perm_assignment_['permission'].codename,
-                    partial_perms=new_perm_assignment_.get('partial_permissions'),
+                    user_obj=new_perm_assignment['user'],
+                    perm=new_perm_assignment['permission'].codename,
+                    partial_perms=new_perm_assignment.get('partial_permissions'),
                 )
                 print('+++', perm)
 
@@ -419,12 +451,15 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
                 )
                 print('++++++', perm, flush=True)
 
-        return new_perm_assignments
+        return validated_data['assignments']
 
     def validate(self, attrs):
         usernames = []
         codenames = []
         partial_codenames = []
+        # Loop on POST data (i.e. `attrs['assignments']`) to retrieve code names,
+        # and usernames. We use lists and not sets because we do need to keep
+        # duplicates and the order for later process.
         for assignment in attrs['assignments']:
             codename = self._get_permission_codename(assignment['permission'])
             codenames.append(codename)
@@ -436,14 +471,24 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
 
             usernames.append(self._get_username(assignment['user']))
 
-        self._validate_codenames(partial_codenames, suffix=SUFFIX_SUBMISSIONS_PERMS)
+        # Validate if code names and usernames are valid and retrieve
+        # all users and permissions related to `codenames` and `usernames`
+        self._validate_codenames(
+            partial_codenames, suffix=SUFFIX_SUBMISSIONS_PERMS
+        )
         users = self._validate_usernames(usernames)
         permissions = self._validate_codenames(codenames)
 
+        # Double check that we have as many code names and usernames as
+        # permission assignments. If it is not the case, something went south in
+        # validation.
         assert len(codenames) == len(usernames) == len(attrs['assignments'])
 
         assignment_objects = []
+        # Loop on POST data to convert all URLs to their objects counterpart
         for idx, assignment in enumerate(attrs['assignments']):
+            # As already said above, the positions in `usernames`, `codenames`
+            # should (and must) be the same as in `attrs['assignments']`.
             assignment_object = {
                 'user': self._get_object(usernames[idx], users, 'username'),
                 'permission': self._get_object(codenames[idx], permissions, 'codename')
@@ -451,6 +496,9 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
             if codenames[idx] == PERM_PARTIAL_SUBMISSIONS:
                 assignment_object['partial_permissions'] = defaultdict(list)
                 for partial_perms in assignment['partial_permissions']:
+                    # Because, we kept the same order at the beginning, the
+                    # first occurrence of `partial_codenames[0]` always belongs
+                    # to the user we are processing in `assignment_object`.
                     partial_codename = partial_codenames.pop(0)
                     assignment_object['partial_permissions'][
                         partial_codename
@@ -458,11 +506,16 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
 
             assignment_objects.append(assignment_object)
 
+        # Replace 'assignments' property with converted objects
+        # Useful to process data when calling `.create()`
         attrs['assignments'] = assignment_objects
 
         return attrs
 
     def _get_permission_codename(self, permission_url: str) -> str:
+        """
+        Retrieve the code name with reverse matching of the permission URL
+        """
         try:
             resolver_match = absolute_resolve(permission_url)
             codename = resolver_match.kwargs['codename']
@@ -476,6 +529,9 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
         return codename
 
     def _get_username(self, user_url: str) -> str:
+        """
+        Retrieve the username with reverse matching of the user URL
+        """
         try:
             resolver_match = absolute_resolve(user_url)
             username = resolver_match.kwargs['username']
@@ -489,6 +545,13 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
         return username
 
     def _validate_codenames(self, codenames: list, suffix: str = None) -> list:
+        """
+        Return a list of Permission models matching `codenames`.
+
+        If number of distinct code names does not match the number of
+        assignable permissions on the asset, some code names are invalid
+        and an error is raised.
+        """
         asset = self.context['asset']
         codenames = set(codenames)
         assignable_permissions = asset.get_assignable_permissions(
@@ -496,22 +559,45 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
         )
         diff = codenames.difference(assignable_permissions)
         if diff:
-            raise serializers.ValidationError('ERREUR CODENAMES')
+            raise serializers.ValidationError(t('Invalid code names'))
 
         if suffix:
+            # No need to return Permission objects when validating partial
+            # permission code names
             return
 
         return Permission.objects.filter(codename__in=codenames)
 
     def _validate_usernames(self, usernames: list) -> list:
+        """
+        Return a list of User models matching `usernames`.
+
+        If number of distinct usernames does not match the number of
+        users returned by the QuerySet, some usernames are invalid
+        and an error is raised.
+        """
         usernames = set(usernames)
-        users = list(User.objects.filter(username__in=usernames))
+        # We need to convert to a list and keep results in memory in order to
+        # pass it to `._get_object()`
+        # It is not designed to support a ton of users but it should be safe
+        # with reasonable quantity.
+        users = list(
+            User.objects.only('pk', 'username').filter(username__in=usernames)
+        )
         if len(users) != len(usernames):
-            raise serializers.ValidationError('ERREUR USERS')
+            raise serializers.ValidationError(t('Invalid usernames'))
 
         return users
 
-    def _get_object(self, value, object_list, fieldname):
+    def _get_object(
+        self, value: str, object_list: list, fieldname: str
+    ) -> Union[User, Permission]:
+        """
+        Search for a match in `object_list` where the value of
+        property `fieldname` equals `value`
+
+        `value` should be a unique identifier
+        """
         for obj in object_list:
             if value == getattr(obj, fieldname):
                 return obj
