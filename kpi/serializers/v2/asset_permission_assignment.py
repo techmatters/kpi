@@ -1,4 +1,5 @@
 # coding: utf-8
+import copy
 from collections import defaultdict
 
 from django.contrib.auth.models import Permission, User
@@ -331,16 +332,13 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
         request = self.context['request']
         asset = self.context['asset']
 
-        new_assignments = validated_data['assignments']
-        new_assignments_by_user = defaultdict(list)
-        searchable_new_assigns = []
+        new_perm_assignments = validated_data['assignments']
 
-        for new_assignment in new_assignments:
-            new_assignments_by_user[new_assignment['user'].pk].append(new_assignment)
-            searchable_new_assigns.append((
-                new_assignment['user'].pk,
-                new_assignment['permission'].pk,
-            ))
+        new_perm_assignments_by_user = defaultdict(dict)
+        for new_perm_assignment in new_perm_assignments:
+            new_perm_assignments_by_user[new_perm_assignment['user'].pk][
+                new_perm_assignment['permission'].pk
+            ] = new_perm_assignment
 
         old_assignments = list(
             get_user_permission_assignments_queryset(
@@ -348,14 +346,17 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
             ).exclude(user=asset.owner)
         )
 
+        new_perm_assignments_by_user_copy = copy.deepcopy(
+            new_perm_assignments_by_user
+        )
         old_assign_idxs_to_del = []
 
         for old_assign_idx, old_assign in enumerate(old_assignments):
             try:
-                new_assign_idx = searchable_new_assigns.index(
-                    (old_assign.user_id, old_assign.permission_id)
-                )
-            except ValueError:
+                perm_assignment = new_perm_assignments_by_user[old_assign.user_id][
+                    old_assign.permission_id
+                ]
+            except KeyError:
                 # An old assignment that has been removed
                 old_assign_idxs_to_del.append(old_assign_idx)
             else:
@@ -365,11 +366,13 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
                 # those to avoid diffing them
 
                 if (
-                    new_assignments[new_assign_idx]['permission'].codename
-                    != PERM_PARTIAL_SUBMISSIONS
+                    perm_assignment[
+                        'permission'
+                    ].codename != PERM_PARTIAL_SUBMISSIONS
                 ):
-                    del new_assignments[new_assign_idx]
-                    del searchable_new_assigns[new_assign_idx]
+                    del perm_assignment[old_assign.user_id][
+                        old_assign.permission_id
+                    ]
 
         # let's do the removals first
         # …in case they remove something implied by a new assignment (?)
@@ -382,18 +385,19 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
 
         # ToDo Bulk delete
 
-        for ser in new_assignments:
-            if ser['user'].pk in users_to_redo:
+        for user_id, new_perm_assignments_ in new_perm_assignments_by_user.items():
+            if user_id in users_to_redo:
                 # gonna have to deal with you later anyway
+                print('REDO', user_id, flush=True)
                 continue
 
-            print('SER', ser, flush=True)
-            perm = asset.assign_perm(
-                user_obj=ser['user'],
-                perm=ser['permission'].codename,
-                partial_perms=ser.get('partial_permissions'),
-            )
-            print('+++', perm)
+            for new_perm_assignment_ in new_perm_assignments_.values():
+                perm = asset.assign_perm(
+                    user_obj=new_perm_assignment_['user'],
+                    perm=new_perm_assignment_['permission'].codename,
+                    partial_perms=new_perm_assignment_.get('partial_permissions'),
+                )
+                print('+++', perm)
 
         # whoops, you had manage and got reduced to change
         # the BE had manage, change, view
@@ -406,16 +410,16 @@ class BulkPermissionAssignmentSerializer(serializers.Serializer):
 
         # how about: re-add all extant perms for users who had deletions
         for user_id in users_to_redo:
-            extant_assigns = new_assignments_by_user[user_id]
-            for serializer in extant_assigns:
+            extant_assigns = new_perm_assignments_by_user_copy[user_id]
+            for new_perm_assignment in extant_assigns.values():
                 perm = asset.assign_perm(
-                    user_obj=serializer['user'],
-                    perm=serializer['permission'].codename,
-                    partial_perms=serializer.get('partial_permissions'),
+                    user_obj=new_perm_assignment['user'],
+                    perm=new_perm_assignment['permission'].codename,
+                    partial_perms=new_perm_assignment.get('partial_permissions'),
                 )
                 print('++++++', perm, flush=True)
 
-        return new_assignments
+        return new_perm_assignments
 
     def validate(self, attrs):
         usernames = []
