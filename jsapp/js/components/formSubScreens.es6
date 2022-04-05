@@ -1,4 +1,4 @@
-import React from 'react';
+import React,  { Suspense } from 'react';
 import PropTypes from 'prop-types';
 import reactMixin from 'react-mixin';
 import autoBind from 'react-autobind';
@@ -11,7 +11,6 @@ import DocumentTitle from 'react-document-title';
 import SharingForm from './permissions/sharingForm';
 import ProjectSettings from './modalForms/projectSettings';
 import ConnectProjects from 'js/components/dataAttachments/connectProjects';
-import FormGallery from 'js/components/formGallery/formGallery';
 import FormMedia from './modalForms/formMedia';
 import DataTable from 'js/components/submissions/table';
 import ProjectDownloads from 'js/components/projectDownloads/projectDownloads';
@@ -20,6 +19,8 @@ import FormMap from './map';
 import RESTServices from './RESTServices';
 import LoadingSpinner from 'js/components/common/loadingSpinner';
 import {ROUTES} from 'js/router/routerConstants';
+
+const FormGallery = React.lazy(() => import('./formGallery/formGallery'));
 
 export class FormSubScreens extends React.Component {
   constructor(props){
@@ -52,7 +53,11 @@ export class FormSubScreens extends React.Component {
         case ROUTES.FORM_TABLE.replace(':uid', this.state.uid):
           return <DataTable asset={this.state} />;
         case ROUTES.FORM_GALLERY.replace(':uid', this.state.uid):
-          return <FormGallery />;
+          return (
+            <Suspense fallback={<div>Image Gallery</div>}>
+              <FormGallery asset={this.state}/>
+            </Suspense>
+          );
         case ROUTES.FORM_MAP.replace(':uid', this.state.uid):
           return <FormMap asset={this.state} />;
         case ROUTES.FORM_MAP_BY
