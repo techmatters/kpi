@@ -54,7 +54,7 @@ export class FormSubScreens extends React.Component {
           return <DataTable asset={this.state} />;
         case ROUTES.FORM_GALLERY.replace(':uid', this.state.uid):
           return (
-            <Suspense fallback={<div>Image Gallery</div>}>
+            <Suspense fallback={<h1>Image Gallery</h1>}>
               <FormGallery asset={this.state}/>
             </Suspense>
           );
