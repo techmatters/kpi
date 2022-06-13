@@ -80,6 +80,11 @@ INSTALLED_APPS = (
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'django.contrib.sites',
+    'allauth',
+    'allauth.account',
+    'allauth.socialaccount',
+    'terraso_allauth',
     'reversion',
     'private_storage',
     'kobo.apps.KpiConfig',
@@ -109,6 +114,7 @@ INSTALLED_APPS = (
     'kobo.apps.shadow_model.ShadowModelAppConfig',
     'trench',
     'kobo.apps.mfa.MfaAppConfig',
+    'kobo.apps.external_auth.ExternalAuthAppConfig',
 )
 
 MIDDLEWARE = [
@@ -129,6 +135,18 @@ MIDDLEWARE = [
 if os.environ.get('DEFAULT_FROM_EMAIL'):
     DEFAULT_FROM_EMAIL = env.str('DEFAULT_FROM_EMAIL')
     SERVER_EMAIL = DEFAULT_FROM_EMAIL
+
+SITE_ID = 1
+
+SOCIALACCOUNT_PROVIDERS = {
+    'terraso': {
+        'SCOPE': [
+            'email',
+            'openid',
+            'profile',
+        ],
+    },
+}
 
 # Configuration options that superusers can modify in the Django admin
 # interface. Please note that it's not as simple as moving a setting into the

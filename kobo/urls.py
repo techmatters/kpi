@@ -9,6 +9,7 @@ from kobo.apps.service_health.views import service_health
 admin.autodiscover()
 
 urlpatterns = [
+    re_path(r'^allauth/', include('allauth.urls')),
     re_path(r'^admin/', admin.site.urls),
     # https://github.com/stochastic-technologies/django-loginas
     re_path(r'^admin/', include('loginas.urls')),

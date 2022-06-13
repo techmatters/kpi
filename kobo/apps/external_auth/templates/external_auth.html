@@ -1,0 +1,21 @@
+{% extends "registration.html" %}
+
+{% load static %}
+{% load i18n %}
+{% load socialaccount %}
+
+{% block content %}
+  <form 
+      action="{% provider_login_url provider.id %}"
+      method="post" 
+      class="registration registration--login">
+    {% csrf_token %}
+    <button
+      type="submit"
+      name="login with {{ provider.name }}"
+      class="kobo-button kobo-button--blue kobo-button--fullwidth"
+    >
+    {% trans "Continue with" %} {{ provider.name }}
+    </button>
+  </form>
+{% endblock %}
